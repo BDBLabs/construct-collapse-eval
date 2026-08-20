@@ -1,5 +1,5 @@
 [project]
-name = "construct-collapse-eval"
+name = "construct-collapse"
 version = "0.1.0"
 description = "Synthetic selective-answering simulation for construct collapse in scalar preference evaluation"
 requires-python = ">=3.10"
