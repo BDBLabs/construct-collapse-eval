@@ -18,9 +18,9 @@ non-convex-frontier analysis explaining *why* the scalar regime collapses sharpl
 while CRS behaves as a smooth dial. All core claims have held up under every stress
 test run so far.
 
-**Open / not yet run:** distribution-shift test (train under one evidence-proportion
-mix, evaluate under another); the natural-language LLM extension (real model outputs
+**Open / not yet run:** the natural-language LLM extension (real model outputs
 + rubric judges) described as an optional follow-up in the original experiment design.
+Distribution-shift sweep is complete — see Section 8 of `RESULTS.md`.
 
 ## Setup
 
