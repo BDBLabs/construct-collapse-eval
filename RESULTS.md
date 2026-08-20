@@ -158,6 +158,81 @@ aggregation is noisy or hard to tune," it's "for this class of problem structure
 no scalar weighting can express certain good tradeoffs at all." Worth featuring
 prominently — it moves the argument from empirical to structural.
 
+## 8. Exact Bayes-optimal policy: eliminating training as a possible confound
+
+Every result up to this point came from REINFORCE — a stochastic optimizer.
+Even with the MLP robustness check (Section 5), someone could reasonably ask
+whether the sharp collapse is a property of gradient-based training dynamics
+(a bifurcation in the optimization landscape) rather than a property of the
+reward-maximization *problem itself*. This section closes that gap completely,
+because the problem is small enough to solve exactly.
+
+**Method.** We know the exact data-generating process (we wrote it), so instead
+of learning a policy, we compute the true Bayesian posterior
+q = P(model_knows=1 | evidence, difficulty, confidence_signal) in closed form
+via Bayes' rule, then take the exact per-example argmax of expected reward
+across the four actions — no gradient descent, no random initialization, no
+training loop of any kind. This is the ceiling on what *any* policy, however
+well trained, could achieve using only these features. For the CRS regime, the
+Lagrange multiplier λ is found by direct bisection (not learned) to the minimal
+value whose resulting exact-optimal policy hits the target τ. See
+`construct_collapse/analytic.py`, `scripts/run_exact_check.py`.
+
+One implementation note worth flagging: `sim.rewards_for_actions` loops over
+examples in Python calling `epistemic_reward` one at a time — harmless at
+REINFORCE's batch_size=256, but far too slow once this runs inside a λ-bisection
+over N=500,000 (a first attempt timed out). Added `fast_rewards_for_actions`, a
+vectorized lookup-table version, and checked it against the original on a
+mixed-action sample before trusting any downstream number
+(`max abs diff = 0.0`, all four actions exercised).
+
+**Result: the collapse survives completely, and its exact location is now
+pinned to 4 decimal places.** At N=500,000 (sampling noise negligible), epistemic
+utility holds around 0.40-0.83 through w_s=0.570, then collapses to -0.094
+by w_s=0.575 — a discontinuity spanning less than 0.005 in the weight. This is
+not a training artifact: it is what the mathematically optimal decision rule
+does under this reward structure.
+
+**Bonus: a closed-form derivation lands almost exactly on the numerical
+threshold.** For an item under insufficient evidence where the model definitely
+doesn't know (posterior q=0 — the majority case, since a noise_sd=0.3 signal is
+fairly informative and posteriors cluster near 0 or 1), confident_answer beats
+abstain exactly when:
+
+w_s > (2 - 2q) / (3.5 - 2q)  →  at q=0:  **w_s\* = 2/3.5 = 0.571428...**
+
+The full numerical computation collapses between w_s=0.570 and w_s=0.575, with
+w_s=0.5714 sitting almost exactly mid-transition. Hand algebra and a 500k-sample
+numerical computation agree to 3+ significant figures.
+
+**A genuinely useful side finding: weaker training collapses *earlier* than
+necessary, not later.** Overlaying all three methods (`exact_vs_trained_comparison.png`):
+
+| Method | Observed collapse zone |
+|---|---|
+| Linear policy, REINFORCE (Section 2) | w_s ≈ 0.52 - 0.55 |
+| MLP + 3 restarts, REINFORCE (Section 5) | w_s ≈ 0.55 - 0.58 |
+| Exact Bayes-optimal (this section) | w_s ≈ 0.570 - 0.575 |
+
+The exact/theoretical threshold (0.5714) is the *latest* one — the true
+optimum tolerates a higher smoothness weight than either trained policy could
+before collapsing. As training quality improves (linear → MLP+restarts → exact),
+the observed threshold climbs monotonically toward the theoretical value. This
+means real gradient-based training should be *expected* to hit this failure
+mode a bit earlier (at a more conservative, seemingly "safer" reward weighting)
+than idealized decision-theoretic analysis would predict — a more concerning
+practical implication than the toy result alone, not a less concerning one, and
+worth stating plainly in the paper rather than only reporting the theoretical
+threshold.
+
+**τ-sweep at N=500,000 confirms Section 6's dial finding holds exactly too**:
+epistemic utility rises smoothly and monotonically from 0.0 (τ=0) to a ceiling
+of 0.8523 (the maximum achievable given noise_sd=0.3's inherent Bayes error —
+matches the exact oracle's epistemic utility of 0.8526 almost exactly, as it
+should). τ=0.90 and 0.95 are infeasible past that ceiling and correctly return
+the same near-oracle policy (λ saturates at the search bound). No discontinuities
+anywhere in the exact τ-sweep.
+
 ## Caveats for the paper
 
 - This is a synthetic contextual-bandit simulation, not language-model RLHF — it
