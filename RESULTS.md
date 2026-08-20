@@ -233,6 +233,90 @@ should). τ=0.90 and 0.95 are infeasible past that ceiling and correctly return
 the same near-oracle policy (λ saturates at the search bound). No discontinuities
 anywhere in the exact τ-sweep.
 
+**Bonus, found while building the τ-sweep comparison figure**: the REINFORCE
+τ-sweep from Section 6 has real jaggedness (achieved epistemic utility jumps
+from 0.036 at τ=0.2 to 0.438 at τ=0.3, badly missing both targets) that
+completely disappears in the exact computation (every τ from 0 to 0.85 is hit
+almost exactly, `epistemic_utility ≈ τ` at every row). The "roughish" transition
+flagged in Section 6 was REINFORCE's Lagrangian dual-ascent struggling to
+converge precisely, not a real property of CRS. CRS's dial is smoother than we
+gave it credit for. See `figures/crs_dial_exact_vs_trained.png`.
+
+## 9. Distribution shift: does CRS's certified floor transport across deployment mixes?
+
+Every prior section trained and evaluated under the same evidence-proportion mix
+(40% sufficient / 30% ambiguous / 30% insufficient). CRS's λ is calibrated once,
+via bisection, to hit a target τ under that mix — it is not re-tuned per
+deployment environment. The practically important question a mitigation like
+this has to answer is not "does it work on the benchmark," it's "does the
+certified guarantee survive contact with a different deployment distribution."
+
+**Method.** Calibrate CRS's λ (and fix scalar's weights, and oracle) under the
+training mix as always, then evaluate those exact same fixed policies —
+no retraining, no recalibration — on five deployment mixes: same-as-training,
+an "easier" mix with more sufficient-evidence questions (70/20/10), an
+ambiguous-heavy mix (20/50/30), and two "harder" mixes with progressively more
+insufficient-evidence questions (20/30/50 and 10/20/70). Ran this both with the
+exact Bayes-optimal policies (N=500k per mix, `run_distribution_shift_exact.py`)
+and, as a cross-check, with actually-REINFORCE-trained linear policies (5 seeds,
+`run_distribution_shift_reinforce.py`) — same fixed trained policy object
+evaluated across all five deployment sets.
+
+**Result: the certified floor does not transport, and the direction is the
+opposite of the intuitive one.** Under the "easier" mix (more sufficient-evidence
+questions — intuitively a gentler deployment environment), CRS's achieved
+epistemic utility drops to 0.786, undershooting its own calibrated τ=0.85 target
+by 0.064. Every mix with *more* insufficient evidence over-satisfies the target
+instead (up to 0.943 under "much harder"). The REINFORCE cross-check reproduces
+this almost exactly (0.786 under "easier" vs. the exact computation's 0.786) —
+this is not an artifact of the idealized decision rule. See
+`figures/distribution_shift.png`.
+
+**But the safety-relevant per-example rate is genuinely invariant.**
+Unsupported-certainty rate (confident answers specifically among
+insufficient-evidence items) stays flat across all five mixes for every regime
+(CRS: 0.0306-0.0311; scalar: 0.0415-0.0485) — expected, since the decision rule
+is a fixed function of individual (evidence, difficulty, confidence_signal)
+features and doesn't reference the population mix at all. Worth being honest
+that this invariance is close to a tautology given how the policy is
+constructed, not a surprising discovery — but it does correctly separate two
+different questions that are easy to conflate: whether the policy's *behavior on
+hard cases* degrades under shift (it doesn't, here) versus whether the
+*aggregate certified number* remains valid under shift (it doesn't).
+
+**Mechanism, verified rather than assumed.** Traced why "easier" hurts the
+aggregate: under the calibrated CRS policy, sufficient-evidence items split into
+78.3% confident_answer (mean r_e=0.970, close to but below the guaranteed
+ceiling), 7.9% qualified_answer (mean r_e=0.036 — weak, near the correctness
+boundary), and **13.8% clarify (r_e=-0.2 flat penalty)**. That last group is the
+main driver: to hit a demanding τ=0.85 in aggregate, the Lagrangian-optimal
+policy doesn't only get very conservative on insufficient-evidence items — it
+also starts unnecessarily hedging on a real slice (13.8%) of genuinely
+sufficient-evidence items, incurring a straight penalty rather than forgoing
+upside. Weighted average confirms the arithmetic exactly:
+0.783×0.970 + 0.079×0.036 + 0.138×(−0.2) = 0.735, matching the measured
+sufficient-evidence-conditional epistemic utility of 0.735. When the deployment
+mix has proportionally more sufficient-evidence items, this weak spot gets
+weighted more heavily, dragging the aggregate below τ.
+
+**Important caveat on how much weight this specific mechanism can bear**: the
+-0.2 "unnecessary clarify under sufficient evidence" penalty driving most of
+this is one of the `FILL` reward-table cells (my extrapolation, not from the
+source doc) — flagged the same way in Section 1. The *qualitative* finding (a
+single pooled population-level constraint has no per-category structure, so it
+can silently over- or under-shoot depending on which evidence category the
+deployment distribution happens to weight) doesn't depend on this specific
+value and should generalize. But the *exact magnitude* (0.064 undershoot) is
+sensitive to a judgment-call reward value and shouldn't be quoted as precise
+without sign-off on that cell.
+
+**This is a genuine limitation to report, not a reason to walk back CRS's
+case.** It also points to an easy, testable extension: a *stratified* CRS with
+separate per-evidence-category constraints (rather than one pooled
+population-average constraint) should prevent this specific cross-category
+leakage — worth flagging as future work rather than running now, since it's a
+new mechanism, not a robustness check of the existing one.
+
 ## Caveats for the paper
 
 - This is a synthetic contextual-bandit simulation, not language-model RLHF — it

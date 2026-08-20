@@ -11,24 +11,33 @@ covers setup and reproduction.
 
 ## Status
 
-8 experiments run so far (see `RESULTS.md` for detail): primary scalar-vs-CRS-vs-oracle
+9 experiments run so far (see `RESULTS.md` for detail): primary scalar-vs-CRS-vs-oracle
 comparison, a smoothness-weight Pareto sweep, a policy-class robustness check (MLP vs.
 linear), a constraint-ablation, a noisy-evaluator ablation, a τ-sweep, a
 non-convex-frontier analysis explaining *why* the scalar regime collapses sharply
-while CRS behaves as a smooth dial, and an exact Bayes-optimal policy check that
+while CRS behaves as a smooth dial, an exact Bayes-optimal policy check that
 eliminates training-algorithm artifacts entirely and pins the collapse threshold
-to a closed-form value (w_s* = 2/3.5). All core claims have held up under every
-stress test run so far.
+to a closed-form value (w_s* = 2/3.5), and a distribution-shift test.
 
-**Open / not yet run:** distribution-shift test (train under one evidence-proportion
-mix, evaluate under another); the natural-language LLM extension (real model outputs
-+ rubric judges) described as an optional follow-up in the original experiment design.
+**The distribution-shift result is a real, reportable limitation, not just a
+robustness confirmation**: CRS's certified epistemic floor (τ) does not
+transport across deployment mixes — it undershoots its own target under a mix
+with *more* easy (sufficient-evidence) questions, for a verified mechanistic
+reason (Section 9). The safety-relevant per-example rate stays invariant, but
+the aggregate certified number does not. This came from actually trying to
+break the mitigation, not from confirming it works — treat it as a genuine
+finding for the paper's limitations section, not something to omit.
+
+**Open / not yet run:** reward-table sensitivity analysis (how much do the
+`FILL` cells, as opposed to the `DOC` cells, drive the specific numbers reported
+throughout); the natural-language LLM extension (real model outputs + rubric
+judges) described as an optional follow-up in the original experiment design.
 
 **Publication plan:** core findings are being scoped into an 8-page submission for
 the TAE (Trust-AI-Eval) NeurIPS 2026 workshop (deadline Aug 29, 2026); deeper
-material here (non-convexity theory, exact-optimal-policy validation) is earmarked
-for a longer companion paper, not blocked by the workshop deadline since TAE
-submissions are non-archival.
+material here (non-convexity theory, exact-optimal-policy validation, the
+distribution-shift limitation) is earmarked for a longer companion paper, not
+blocked by the workshop deadline since TAE submissions are non-archival.
 
 ## Setup
 
@@ -52,6 +61,8 @@ uv run python scripts/run_mlp_sweep.py     # Section 5: MLP policy-class robustn
 uv run python scripts/run_ablations.py     # Section 3-4: constraint ablation + noisy-evaluator ablation
 uv run python scripts/run_tau_sweep.py     # Section 6: CRS epistemic-floor tau sweep, 30 seeds
 uv run python scripts/run_exact_check.py   # Section 8: exact Bayes-optimal policy, no training loop, N=500k
+uv run python scripts/run_distribution_shift_exact.py       # Section 9: exact policies under 5 deployment mixes
+uv run python scripts/run_distribution_shift_reinforce.py   # Section 9: REINFORCE cross-check, 5 seeds
 ```
 
 Figures in `figures/` were generated from these results with ad hoc plotting code
