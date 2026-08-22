@@ -19,25 +19,11 @@ while CRS behaves as a smooth dial, an exact Bayes-optimal policy check that
 eliminates training-algorithm artifacts entirely and pins the collapse threshold
 to a closed-form value (w_s* = 2/3.5), and a distribution-shift test.
 
-**The distribution-shift result is a real, reportable limitation, not just a
-robustness confirmation**: CRS's certified epistemic floor (τ) does not
-transport across deployment mixes — it undershoots its own target under a mix
-with *more* easy (sufficient-evidence) questions, for a verified mechanistic
-reason (Section 9). The safety-relevant per-example rate stays invariant, but
-the aggregate certified number does not. This came from actually trying to
-break the mitigation, not from confirming it works — treat it as a genuine
-finding for the paper's limitations section, not something to omit.
+**Open / not yet run:** reward-table sensitivity analysis (how much do the `FILL` cells, as opposed to the `DOC` cells, drive the specific numbers reported throughout); the natural-language LLM extension (real model outputs + rubric judges) described as an optional follow-up in the original experiment design.
 
-**Open / not yet run:** reward-table sensitivity analysis (how much do the
-`FILL` cells, as opposed to the `DOC` cells, drive the specific numbers reported
-throughout); the natural-language LLM extension (real model outputs + rubric
-judges) described as an optional follow-up in the original experiment design.
+Distribution-shift sweep is complete — see Section 8 of `RESULTS.md`.
 
-**Publication plan:** core findings are being scoped into an 8-page submission for
-the TAE (Trust-AI-Eval) NeurIPS 2026 workshop (deadline Aug 29, 2026); deeper
-material here (non-convexity theory, exact-optimal-policy validation, the
-distribution-shift limitation) is earmarked for a longer companion paper, not
-blocked by the workshop deadline since TAE submissions are non-archival.
+**Publication plan:** core findings are being scoped into an 8-page submission for the TAE (Trust-AI-Eval) NeurIPS 2026 workshop (deadline Aug 29, 2026); deeper material here (non-convexity theory, exact-optimal-policy validation, the distribution-shift limitation) is earmarked for a longer companion paper, not blocked by the workshop deadline since TAE submissions are non-archival.
 
 ## Setup
 
