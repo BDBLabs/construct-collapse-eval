@@ -1,0 +1,4 @@
+evidence,matched_lambda,matched_target,pooled_lambda,uniform_feasible,uniform_lambda,uniform_target
+sufficient,6.794745549964846,0.7347910796714826,6.794896193866615,False,nan,0.85
+ambiguous,6.794896193866615,0.8553131569288264,6.794896193866615,False,nan,0.85
+insufficient,6.663104402445081,0.9984531580245761,6.794896193866615,False,nan,0.85
