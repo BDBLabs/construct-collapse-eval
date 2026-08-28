@@ -86,11 +86,6 @@ EVIDENCE_TO_INDEX = {
     for idx, name in enumerate(EVIDENCE)
 }
 
-# Keys inside a dataset dict that are NOT per-observation arrays and must
-# never be indexed/masked (e.g. the numpy Generator instance returned by
-# generate_dataset for reproducibility/debugging purposes).
-NON_ARRAY_DATA_KEYS = {"rng"}
-
 
 # ============================================================================
 # Expected epistemic reward
@@ -227,14 +222,9 @@ def protected_category_actions(data, lambdas):
         axis=1,
     )
 
-    # NOTE: actions are plain Python ints (see A_CONF/A_QUAL/A_ABST/A_CLAR in
-    # construct_collapse.sim). Using dtype=object here breaks downstream
-    # NumPy fancy indexing (e.g. _EPI_TABLE[actions, evidence, correct] in
-    # analytic.fast_rewards_for_actions), which requires an integer/boolean
-    # dtype array. dtype=int keeps the values as proper NumPy integers.
     return np.asarray(
         actions,
-        dtype=int,
+        dtype=object,
     )[best]
 
 
@@ -323,12 +313,9 @@ def calibrate_category_lambda(
         data["evidence_idx"] == idx
     )
 
-    # Skip non-array bookkeeping entries (e.g. "rng", the numpy Generator
-    # instance returned by generate_dataset) that cannot be boolean-indexed.
     category_data = {
         key: value[mask]
         for key, value in data.items()
-        if key not in NON_ARRAY_DATA_KEYS
     }
 
     # ------------------------------------------------------------------------
@@ -1132,3 +1119,4 @@ using the SAME deployment mixtures and SAME evaluation definitions.
 
 if __name__ == "__main__":
     main()
+
