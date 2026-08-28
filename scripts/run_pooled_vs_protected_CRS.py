@@ -1,897 +1,948 @@
+```python
 #!/usr/bin/env python3
 """
-Original pooled CRS vs. protected-category CRS.
+Protected-category constraint distribution-shift experiment.
 
-Compares:
+Question
+--------
+The pooled CRS experiment calibrates one aggregate epistemic constraint:
 
-1. Original pooled CRS
-   - One global epistemic floor calibrated on the 40/30/30 mixture.
+    E[r_e] >= tau
 
-2. Protected CRS
-   - Independent category-conditional epistemic floors.
-   - Evaluates every feasible configuration from the protected-category
-     constraint-shift experiment.
+under a calibration distribution.
 
-Both policies are calibrated once and then frozen for evaluation under
-the same deployment distributions.
+That guarantee can fail under distribution shift because the aggregate
+constraint permits epistemic performance to be distributed unevenly across
+evidence categories.
 
-Outputs:
-    results/pooled_vs_protected_crs.csv
-    results/pooled_vs_protected_crs_summary.csv
+This experiment tests the stronger alternative:
+
+    E[r_e | evidence=k] >= tau_k   for every evidence category k.
+
+The category floors are specified independently. They are NOT copied from
+the pooled CRS solution.
+
+For each category k, we independently solve:
+
+    maximize E[r_s | k]
+
+    subject to
+
+        E[r_e | k] >= tau_k
+
+using a category-specific Lagrange multiplier.
+
+The resulting policy is frozen and then evaluated under several deployment
+mixtures.
+
+A successful result means:
+
+    category floors satisfied under calibration
+        AND
+    category floors satisfied under every deployment mix.
+
+This would provide evidence that category-conditional protection repairs
+the specific pooled-aggregate transport failure.
+
+A failure would be equally informative: it would show that conditioning
+only on evidence category is insufficient and motivate finer-grained
+conditional guarantees, uncertainty-set constraints, or DRO.
+
+Outputs
+-------
+results/protected_category_constraint_shift.csv
+
+    One row per target configuration x deployment mix.
+
+results/protected_category_constraint_shift_targets.csv
+
+    Calibration feasibility and target diagnostics.
+
+results/protected_category_constraint_shift_summary.csv
+
+    Compact deployment summary.
+
+Important
+---------
+This experiment intentionally keeps the policy frozen after calibration.
+Deployment distributions are NOT used to recalibrate lambda.
+
+The aggressive target 0.74 for sufficient evidence is expected to be
+infeasible in this environment and is retained specifically to expose
+the feasibility boundary.
 """
 
 from __future__ import annotations
 
-import csv
-import math
-import random
-from dataclasses import dataclass
+import sys
+from itertools import product
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+
+import numpy as np
+import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Repository paths
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Repository import path
+# ============================================================================
 
-ROOT = Path(__file__).resolve().parents[1]
-RESULTS = ROOT / "results"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+SRC_ROOT = REPO_ROOT / "src"
 
-RESULTS.mkdir(parents=True, exist_ok=True)
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 
-# ---------------------------------------------------------------------------
-# Experiment configuration
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Repository imports
+# ============================================================================
 
-CALIBRATION_N = 500_000
-EVALUATION_N = 500_000
+from construct_collapse.sim import (
+    EVIDENCE,
+    A_CONF,
+    A_QUAL,
+    A_ABST,
+    A_CLAR,
+    epistemic_reward,
+    generate_dataset,
+)
 
-CALIBRATION_MIX = {
+from construct_collapse.analytic import (
+    posterior_knows,
+    evaluate_actions,
+)
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+RESULTS_DIR = REPO_ROOT / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+N_CALIBRATE = 500_000
+N_DEPLOY = 500_000
+
+# Calibration distribution.
+TRAIN_MIX = {
     "sufficient": 0.40,
     "ambiguous": 0.30,
     "insufficient": 0.30,
 }
 
-DEPLOYMENT_MIXES = {
-    "train_40_30_30": {
-        "sufficient": 0.40,
-        "ambiguous": 0.30,
-        "insufficient": 0.30,
-    },
-    "easier_70_20_10": {
-        "sufficient": 0.70,
-        "ambiguous": 0.20,
-        "insufficient": 0.10,
-    },
-    "ambiguous_20_50_30": {
-        "sufficient": 0.20,
-        "ambiguous": 0.50,
-        "insufficient": 0.30,
-    },
-    "harder_20_30_50": {
-        "sufficient": 0.20,
-        "ambiguous": 0.30,
-        "insufficient": 0.50,
-    },
-    "much_harder_10_20_70": {
-        "sufficient": 0.10,
-        "ambiguous": 0.20,
-        "insufficient": 0.70,
-    },
+# EXACT deployment mixtures used by the original distribution-shift test.
+DEPLOY_MIXES = {
+    "train_40_30_30": (0.40, 0.30, 0.30),
+    "easier_70_20_10": (0.70, 0.20, 0.10),
+    "ambiguous_20_50_30": (0.20, 0.50, 0.30),
+    "harder_20_30_50": (0.20, 0.30, 0.50),
+    "much_harder_10_20_70": (0.10, 0.20, 0.70),
 }
 
-# Protected target grid used by the preceding experiment.
-PROTECTED_TARGETS = {
+
+# ============================================================================
+# Independently specified protected-category target grid
+# ============================================================================
+
+CATEGORY_TARGET_GRID = {
     "sufficient": [0.70, 0.72, 0.74],
     "ambiguous": [0.80, 0.85, 0.90],
     "insufficient": [0.95, 0.98, 0.99],
 }
 
-# Original pooled CRS target.
-POOLED_TARGET = 0.85
+LAMBDA_HI = 200.0
+BISECTION_ITERS = 60
 
-# Same lambda ceiling used by the protected experiment.
-MAX_LAMBDA = 200.0
-
-# Reproducibility.
-CALIBRATION_SEED = 20260828
-DEPLOYMENT_SEED = 20260829
+EVIDENCE_TO_INDEX = {
+    name: idx
+    for idx, name in enumerate(EVIDENCE)
+}
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Expected epistemic reward
+# ============================================================================
 
-@dataclass
-class Observation:
-    category: str
-    base_epistemic: float
-
-
-@dataclass
-class CalibrationResult:
-    lambda_value: float
-    achieved: float
-    maximum: float
-    feasible: bool
-
-
-@dataclass
-class Policy:
-    name: str
-    kind: str
-    pooled_lambda: float | None
-    category_lambdas: Dict[str, float] | None
-    targets: Dict[str, float] | None
-    calibration_feasible: bool
-
-
-# ---------------------------------------------------------------------------
-# Model / scoring function
-# ---------------------------------------------------------------------------
-
-def protected_score(base_epistemic: float, lambda_value: float) -> float:
+def expected_action_values(data):
     """
-    Monotone constraint transformation.
+    Compute posterior expected epistemic reward for each action.
 
-    This is intentionally the same functional form used by the protected
-    category experiment:
-
-        score = base + lambda * base * (1 - base)
-
-    followed by clipping to [0, 1].
-
-    Larger lambda values increase epistemic utility while diminishing as
-    base epistemic confidence approaches 1.
-    """
-    score = base_epistemic + lambda_value * base_epistemic * (
-        1.0 - base_epistemic
-    )
-    return max(0.0, min(1.0, score))
-
-
-# ---------------------------------------------------------------------------
-# Synthetic evidence generator
-# ---------------------------------------------------------------------------
-
-def category_base_distribution(category: str, rng: random.Random) -> float:
-    """
-    Generate a base epistemic value for a category.
-
-    The parameters reproduce the qualitative category structure used by the
-    protected-category experiment:
-
-        sufficient    -> highest baseline
-        ambiguous     -> middle baseline
-        insufficient  -> lowest baseline
-
-    The exact calibration behavior is driven by the same transformation
-    used by the preceding experiment.
+    Returns
+    -------
+    dict[str, np.ndarray]
+        action -> expected epistemic reward for each observation.
     """
 
-    if category == "sufficient":
-        # Centered around ~0.45
-        value = rng.betavariate(9.0, 11.0)
+    q = posterior_knows(data)
+    evidence = data["evidence_idx"]
 
-    elif category == "ambiguous":
-        # Centered around ~0.34
-        value = rng.betavariate(7.0, 14.0)
-
-    elif category == "insufficient":
-        # Centered around ~0.20
-        value = rng.betavariate(5.0, 20.0)
-
-    else:
-        raise ValueError(f"Unknown category: {category}")
-
-    return value
-
-
-def generate_dataset(
-    n: int,
-    mix: Dict[str, float],
-    seed: int,
-) -> List[Observation]:
-    """
-    Generate an evaluation population with the requested category mixture.
-    """
-
-    rng = random.Random(seed)
-
-    categories = list(mix.keys())
-    weights = [mix[c] for c in categories]
-
-    observations: List[Observation] = []
-
-    for _ in range(n):
-        category = rng.choices(categories, weights=weights, k=1)[0]
-        base = category_base_distribution(category, rng)
-
-        observations.append(
-            Observation(
-                category=category,
-                base_epistemic=base,
+    abst_lookup = np.array(
+        [
+            epistemic_reward(
+                evidence_idx=e,
+                action=A_ABST,
+                correct=True,
             )
-        )
+            for e in range(len(EVIDENCE))
+        ],
+        dtype=float,
+    )
 
-    return observations
-
-
-# ---------------------------------------------------------------------------
-# Utility helpers
-# ---------------------------------------------------------------------------
-
-def weighted_mean(values: Iterable[float]) -> float:
-    values = list(values)
-    if not values:
-        return float("nan")
-    return sum(values) / len(values)
-
-
-def grouped_mean(
-    observations: Iterable[Observation],
-    scores: Iterable[float],
-) -> Dict[str, float]:
-    totals: Dict[str, float] = {}
-    counts: Dict[str, int] = {}
-
-    for obs, score in zip(observations, scores):
-        totals[obs.category] = totals.get(obs.category, 0.0) + score
-        counts[obs.category] = counts.get(obs.category, 0) + 1
+    clar_lookup = np.array(
+        [
+            epistemic_reward(
+                evidence_idx=e,
+                action=A_CLAR,
+                correct=True,
+            )
+            for e in range(len(EVIDENCE))
+        ],
+        dtype=float,
+    )
 
     return {
-        category: totals[category] / counts[category]
-        for category in totals
+        A_CONF: 2.0 * q - 1.0,
+        A_QUAL: 1.3 * q - 0.4,
+        A_ABST: abst_lookup[evidence],
+        A_CLAR: clar_lookup[evidence],
     }
 
 
-# ---------------------------------------------------------------------------
-# Lambda calibration
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Protected category policy
+# ============================================================================
 
-def calibrate_lambda(
-    observations: List[Observation],
-    target: float,
-) -> CalibrationResult:
+def protected_category_actions(data, lambdas):
     """
-    Find the smallest lambda that reaches the requested epistemic floor.
+    Select actions using a category-specific Lagrange multiplier.
 
-    If the target cannot be reached before MAX_LAMBDA, the configuration
-    is marked infeasible.
-    """
+    For observation x in evidence category k:
 
-    base_scores = [obs.base_epistemic for obs in observations]
-
-    def achieved(lambda_value: float) -> float:
-        scores = [
-            protected_score(base, lambda_value)
-            for base in base_scores
+        argmax_a [
+            r_s(a, x) + lambda_k * r_e(a, x)
         ]
-        return weighted_mean(scores)
 
-    maximum = achieved(MAX_LAMBDA)
+    Parameters
+    ----------
+    data:
+        Dataset.
 
-    if maximum < target:
-        return CalibrationResult(
-            lambda_value=MAX_LAMBDA,
-            achieved=maximum,
-            maximum=maximum,
-            feasible=False,
-        )
+    lambdas:
+        Mapping evidence category -> lambda.
+
+    Returns
+    -------
+    np.ndarray
+        Selected action for each observation.
+    """
+
+    rewards_e = expected_action_values(data)
+    evidence_idx = data["evidence_idx"]
+
+    actions = [A_CONF, A_QUAL, A_ABST, A_CLAR]
+
+    scores = np.column_stack(
+        [
+            np.asarray(
+                rewards_e[action],
+                dtype=float,
+            )
+            for action in actions
+        ]
+    )
+
+    # Scalar objective is epistemic quality of the action's outcome.
+    #
+    # The simulator exposes R_S_BY_ACTION as the action-level task reward.
+    # Use it as the primary reward and add the category-specific epistemic
+    # multiplier.
+    r_s = np.column_stack(
+        [
+            np.full(
+                len(data["evidence_idx"]),
+                float(R_S_BY_ACTION[action]),
+            )
+            for action in actions
+        ]
+    )
+
+    lambda_per_row = np.zeros(len(data["evidence_idx"]), dtype=float)
+
+    for category, idx in EVIDENCE_TO_INDEX.items():
+        mask = evidence_idx == idx
+
+        if not np.any(mask):
+            continue
+
+        lambda_per_row[mask] = lambdas[category]
+
+    objective = r_s + scores * lambda_per_row[:, None]
+
+    best = np.argmax(objective, axis=1)
+
+    return np.asarray(actions, dtype=object)[best]
+
+
+# ============================================================================
+# Category conditional epistemic reward
+# ============================================================================
+
+def category_epistemic_metrics(data, actions):
+    """
+    Calculate epistemic utility conditional on evidence category.
+    """
+
+    metrics = {}
+
+    q = posterior_knows(data)
+
+    # We need the realized/expected epistemic reward associated with the
+    # chosen action. Use the same reward definitions used by the policy.
+    expected_e = expected_action_values(data)
+
+    for category, idx in EVIDENCE_TO_INDEX.items():
+        mask = data["evidence_idx"] == idx
+
+        if not np.any(mask):
+            metrics[category] = np.nan
+            continue
+
+        action_values = np.zeros(mask.sum(), dtype=float)
+
+        category_actions = actions[mask]
+
+        for action in (
+            A_CONF,
+            A_QUAL,
+            A_ABST,
+            A_CLAR,
+        ):
+            action_mask = category_actions == action
+
+            if not np.any(action_mask):
+                continue
+
+            vals = expected_e[action][mask]
+            action_values[action_mask] = vals[action_mask]
+
+        metrics[category] = float(np.mean(action_values))
+
+    return metrics
+
+
+# ============================================================================
+# Calibrate one category
+# ============================================================================
+
+def calibrate_category_lambda(
+    data,
+    category,
+    target,
+):
+    """
+    Independently calibrate lambda for one evidence category.
+
+    The category is observed, so all observations outside the category are
+    irrelevant to this optimization.
+
+    We maximize expected task reward subject to the conditional epistemic
+    floor.
+
+    Returns
+    -------
+    dict
+        lambda, achieved epistemic reward, feasible flag, and diagnostics.
+    """
+
+    idx = EVIDENCE_TO_INDEX[category]
+    mask = data["evidence_idx"] == idx
+
+    category_data = {
+        key: value[mask]
+        for key, value in data.items()
+    }
+
+    # Evaluate epistemic reward at lambda = 0.
+    actions_zero = protected_category_actions(
+        category_data,
+        {name: 0.0 for name in EVIDENCE},
+    )
+
+    m_zero = category_epistemic_metrics(
+        category_data,
+        actions_zero,
+    )[category]
+
+    # Evaluate epistemic reward at a very large lambda.
+    hi = LAMBDA_HI
+
+    actions_hi = protected_category_actions(
+        category_data,
+        {name: hi for name in EVIDENCE},
+    )
+
+    m_hi = category_epistemic_metrics(
+        category_data,
+        actions_hi,
+    )[category]
+
+    # Feasibility is determined by the best epistemic result reachable by
+    # this finite-action policy.
+    if m_hi < target - 1e-12:
+        return {
+            "lambda": np.nan,
+            "achieved": float(m_hi),
+            "feasible": False,
+            "min_lambda": np.nan,
+            "max_lambda": hi,
+            "zero_lambda_epistemic": float(m_zero),
+        }
+
+    # If the unconstrained optimum already satisfies the floor, lambda = 0.
+    if m_zero >= target:
+        return {
+            "lambda": 0.0,
+            "achieved": float(m_zero),
+            "feasible": True,
+            "min_lambda": 0.0,
+            "max_lambda": 0.0,
+            "zero_lambda_epistemic": float(m_zero),
+        }
 
     lo = 0.0
-    hi = MAX_LAMBDA
 
-    for _ in range(70):
-        mid = (lo + hi) / 2.0
+    # Bisection finds the smallest lambda whose induced policy satisfies
+    # the target.
+    for _ in range(BISECTION_ITERS):
+        mid = 0.5 * (lo + hi)
 
-        if achieved(mid) >= target:
+        actions_mid = protected_category_actions(
+            category_data,
+            {name: mid for name in EVIDENCE},
+        )
+
+        m_mid = category_epistemic_metrics(
+            category_data,
+            actions_mid,
+        )[category]
+
+        if m_mid >= target:
             hi = mid
         else:
             lo = mid
 
-    final_lambda = hi
-    final_achieved = achieved(final_lambda)
+    lambda_star = hi
 
-    return CalibrationResult(
-        lambda_value=final_lambda,
-        achieved=final_achieved,
-        maximum=maximum,
-        feasible=True,
+    actions_star = protected_category_actions(
+        category_data,
+        {name: lambda_star for name in EVIDENCE},
     )
 
+    achieved = category_epistemic_metrics(
+        category_data,
+        actions_star,
+    )[category]
 
-# ---------------------------------------------------------------------------
-# Pooled CRS calibration
-# ---------------------------------------------------------------------------
-
-def calibrate_pooled_policy(
-    calibration_data: List[Observation],
-) -> Policy:
-    """
-    Calibrate the original pooled CRS.
-
-    Important:
-        The pooled CRS sees only the aggregate population and therefore
-        has ONE lambda and ONE aggregate target.
-    """
-
-    result = calibrate_lambda(
-        calibration_data,
-        POOLED_TARGET,
-    )
-
-    return Policy(
-        name="original_pooled_crs",
-        kind="pooled",
-        pooled_lambda=result.lambda_value,
-        category_lambdas=None,
-        targets=None,
-        calibration_feasible=result.feasible,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Protected CRS calibration
-# ---------------------------------------------------------------------------
-
-def calibrate_protected_policies(
-    calibration_data: List[Observation],
-) -> List[Policy]:
-    """
-    Calibrate every protected-category target configuration.
-
-    Each category receives an independently calibrated lambda.
-    """
-
-    category_data: Dict[str, List[Observation]] = {
-        category: []
-        for category in PROTECTED_TARGETS
+    return {
+        "lambda": float(lambda_star),
+        "achieved": float(achieved),
+        "feasible": bool(achieved >= target - 1e-10),
+        "min_lambda": float(lo),
+        "max_lambda": float(hi),
+        "zero_lambda_epistemic": float(m_zero),
     }
 
-    for obs in calibration_data:
-        category_data[obs.category].append(obs)
 
-    policies: List[Policy] = []
+# ============================================================================
+# Evaluate a frozen policy
+# ============================================================================
 
-    for sufficient_target in PROTECTED_TARGETS["sufficient"]:
-        for ambiguous_target in PROTECTED_TARGETS["ambiguous"]:
-            for insufficient_target in PROTECTED_TARGETS["insufficient"]:
-
-                targets = {
-                    "sufficient": sufficient_target,
-                    "ambiguous": ambiguous_target,
-                    "insufficient": insufficient_target,
-                }
-
-                lambdas: Dict[str, float] = {}
-                feasible = True
-
-                for category, target in targets.items():
-                    result = calibrate_lambda(
-                        category_data[category],
-                        target,
-                    )
-
-                    lambdas[category] = result.lambda_value
-
-                    if not result.feasible:
-                        feasible = False
-
-                label = (
-                    f"s{sufficient_target:.2f}_"
-                    f"a{ambiguous_target:.2f}_"
-                    f"i{insufficient_target:.2f}"
-                )
-
-                policies.append(
-                    Policy(
-                        name=f"protected_crs_{label}",
-                        kind="protected",
-                        pooled_lambda=None,
-                        category_lambdas=lambdas,
-                        targets=targets,
-                        calibration_feasible=feasible,
-                    )
-                )
-
-    return policies
-
-
-# ---------------------------------------------------------------------------
-# Policy evaluation
-# ---------------------------------------------------------------------------
-
-def evaluate_policy(
-    policy: Policy,
-    observations: List[Observation],
-    deployment_mix: Dict[str, float],
-) -> Dict[str, float | bool | str]:
+def evaluate_protected_policy(
+    data,
+    lambdas,
+    target_tuple,
+):
     """
-    Evaluate a frozen policy.
+    Evaluate a frozen category-protected policy.
 
-    No recalibration occurs here.
-
-    This is critical: the policy calibrated on 40/30/30 is transported
-    unchanged to the deployment distribution.
+    Returns aggregate metrics plus conditional category metrics.
     """
 
-    if policy.kind == "pooled":
-        assert policy.pooled_lambda is not None
+    actions = protected_category_actions(data, lambdas)
 
-        scores = [
-            protected_score(
-                obs.base_epistemic,
-                policy.pooled_lambda,
-            )
-            for obs in observations
-        ]
+    aggregate = evaluate_actions(data, actions)
+    conditional = category_epistemic_metrics(data, actions)
 
-    else:
-        assert policy.category_lambdas is not None
-
-        scores = [
-            protected_score(
-                obs.base_epistemic,
-                policy.category_lambdas[obs.category],
-            )
-            for obs in observations
-        ]
-
-    category_scores = grouped_mean(observations, scores)
-    aggregate = weighted_mean(scores)
-
-    result: Dict[str, float | bool | str] = {
-        "policy": policy.name,
-        "policy_kind": policy.kind,
-        "deploy_mix": "",
-        "epistemic_utility": aggregate,
-        "category_sufficient_epistemic": category_scores.get(
-            "sufficient",
-            float("nan"),
-        ),
-        "category_ambiguous_epistemic": category_scores.get(
-            "ambiguous",
-            float("nan"),
-        ),
-        "category_insufficient_epistemic": category_scores.get(
-            "insufficient",
-            float("nan"),
-        ),
+    targets = {
+        "sufficient": target_tuple[0],
+        "ambiguous": target_tuple[1],
+        "insufficient": target_tuple[2],
     }
 
-    if policy.kind == "protected":
-        assert policy.targets is not None
-
-        undershoots = {
-            category: max(
-                0.0,
-                policy.targets[category]
-                - category_scores.get(category, 0.0),
-            )
-            for category in policy.targets
-        }
-
-        max_undershoot = max(undershoots.values())
-
-        result["max_category_undershoot"] = max_undershoot
-        result["all_category_floors_met"] = (
-            max_undershoot <= 0.0
-        )
-
-        result["target_sufficient"] = policy.targets["sufficient"]
-        result["target_ambiguous"] = policy.targets["ambiguous"]
-        result["target_insufficient"] = policy.targets["insufficient"]
-
-    else:
-        pooled_undershoot = max(
+    undershoots = {
+        category: max(
             0.0,
-            POOLED_TARGET - aggregate,
+            targets[category] - conditional[category],
         )
+        for category in targets
+    }
 
-        result["pooled_target"] = POOLED_TARGET
-        result["pooled_undershoot"] = pooled_undershoot
-        result["pooled_floor_met"] = pooled_undershoot <= 0.0
+    max_undershoot = max(undershoots.values())
 
-        # These are deliberately calculated even though the pooled policy
-        # has no category-specific constraints. This is the point of the
-        # comparison: reveal what the aggregate guarantee says—and does not
-        # say—about categories.
-        result["max_category_undershoot"] = float("nan")
-        result["all_category_floors_met"] = ""
+    aggregate.update(
+        {
+            "category_sufficient_epistemic": conditional["sufficient"],
+            "category_ambiguous_epistemic": conditional["ambiguous"],
+            "category_insufficient_epistemic": conditional["insufficient"],
+            "target_sufficient": targets["sufficient"],
+            "target_ambiguous": targets["ambiguous"],
+            "target_insufficient": targets["insufficient"],
+            "undershoot_sufficient": undershoots["sufficient"],
+            "undershoot_ambiguous": undershoots["ambiguous"],
+            "undershoot_insufficient": undershoots["insufficient"],
+            "max_category_undershoot": max_undershoot,
+            "all_category_floors_met": max_undershoot <= 1e-10,
+        }
+    )
 
-    result["deployment_sufficient_share"] = deployment_mix["sufficient"]
-    result["deployment_ambiguous_share"] = deployment_mix["ambiguous"]
-    result["deployment_insufficient_share"] = deployment_mix["insufficient"]
-
-    return result
+    return aggregate
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # Main experiment
-# ---------------------------------------------------------------------------
+# ============================================================================
 
-def main() -> None:
+def main():
+
     print("=" * 78)
-    print("ORIGINAL POOLED CRS VS. PROTECTED CRS")
+    print("PROTECTED CATEGORY CONSTRAINT — DISTRIBUTION SHIFT")
     print("=" * 78)
+
     print()
-    print(f"Repository:          {ROOT}")
-    print(f"Calibration N:       {CALIBRATION_N:,}")
-    print(f"Evaluation N/mix:    {EVALUATION_N:,}")
-    print(f"Calibration mix:     {CALIBRATION_MIX}")
-    print(f"Pooled CRS target:   {POOLED_TARGET:.2f}")
+    print(f"Calibration N: {N_CALIBRATE:,}")
+    print(f"Deployment N:  {N_DEPLOY:,}")
+    print(f"Training mix:  {TRAIN_MIX}")
     print()
 
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------------
     # Calibration data
-    # -----------------------------------------------------------------------
+    # ------------------------------------------------------------------------
 
-    print("=" * 78)
-    print("CALIBRATION")
-    print("=" * 78)
-
-    calibration_data = generate_dataset(
-        n=CALIBRATION_N,
-        mix=CALIBRATION_MIX,
-        seed=CALIBRATION_SEED,
+    train_mix_tuple = (
+        TRAIN_MIX["sufficient"],
+        TRAIN_MIX["ambiguous"],
+        TRAIN_MIX["insufficient"],
     )
 
-    print()
-    print("Calibrating original pooled CRS...")
-
-    pooled_policy = calibrate_pooled_policy(
-        calibration_data
+    data_train = generate_dataset(
+        N_CALIBRATE,
+        seed=0,
+        evidence_probs=train_mix_tuple,
     )
 
-    if pooled_policy.pooled_lambda is None:
-        raise RuntimeError("Pooled lambda was not calibrated.")
+    # ------------------------------------------------------------------------
+    # Target configurations
+    # ------------------------------------------------------------------------
 
-    print(
-        f"  pooled lambda={pooled_policy.pooled_lambda:.8f}"
-    )
-    print(
-        f"  target={POOLED_TARGET:.6f}"
-    )
-
-    # -----------------------------------------------------------------------
-    # Protected policies
-    # -----------------------------------------------------------------------
-
-    print()
-    print("Calibrating protected CRS configurations...")
-
-    protected_policies = calibrate_protected_policies(
-        calibration_data
-    )
-
-    feasible_protected = [
-        policy
-        for policy in protected_policies
-        if policy.calibration_feasible
-    ]
-
-    print(
-        f"  protected configurations: "
-        f"{len(protected_policies)}"
-    )
-    print(
-        f"  feasible configurations: "
-        f"{len(feasible_protected)}"
-    )
-
-    print()
-    print("Feasible protected policies:")
-
-    for policy in feasible_protected:
-        assert policy.targets is not None
-        assert policy.category_lambdas is not None
-
-        print(
-            "  "
-            f"{policy.name.replace('protected_crs_', '')}: "
-            f"s={policy.category_lambdas['sufficient']:.6f} "
-            f"a={policy.category_lambdas['ambiguous']:.6f} "
-            f"i={policy.category_lambdas['insufficient']:.6f}"
+    target_tuples = list(
+        product(
+            CATEGORY_TARGET_GRID["sufficient"],
+            CATEGORY_TARGET_GRID["ambiguous"],
+            CATEGORY_TARGET_GRID["insufficient"],
         )
+    )
 
-    # -----------------------------------------------------------------------
-    # Evaluation
-    # -----------------------------------------------------------------------
+    calibration_rows = []
+    deployment_rows = []
 
-    print()
-    print("=" * 78)
-    print("DEPLOYMENT EVALUATION")
-    print("=" * 78)
+    for tau_s, tau_a, tau_i in target_tuples:
 
-    all_results: List[Dict[str, object]] = []
+        target_tuple = (tau_s, tau_a, tau_i)
 
-    for deployment_index, (
-        deployment_name,
-        deployment_mix,
-    ) in enumerate(DEPLOYMENT_MIXES.items()):
+        target_label = (
+            f"s{tau_s:.2f}_a{tau_a:.2f}_i{tau_i:.2f}"
+        )
 
         print()
         print("-" * 78)
-        print(f"DEPLOYMENT: {deployment_name}")
-        print("-" * 78)
+        print(f"TARGET CONFIGURATION: {target_label}")
 
-        deployment_data = generate_dataset(
-            n=EVALUATION_N,
-            mix=deployment_mix,
-            seed=DEPLOYMENT_SEED + deployment_index,
+        # --------------------------------------------------------------------
+        # Independently calibrate each category
+        # --------------------------------------------------------------------
+
+        calibration = {}
+
+        for category, target in zip(
+            ("sufficient", "ambiguous", "insufficient"),
+            target_tuple,
+        ):
+
+            result = calibrate_category_lambda(
+                data_train,
+                category,
+                target,
+            )
+
+            calibration[category] = result
+
+            print(
+                f"  {category:12s}: "
+                f"target={target:.4f}  "
+                f"achieved={result['achieved']:.4f}  "
+                f"lambda={result['lambda'] if np.isfinite(result['lambda']) else float('nan'):.6f}  "
+                f"feasible={result['feasible']}"
+            )
+
+        feasible = all(
+            calibration[c]["feasible"]
+            for c in (
+                "sufficient",
+                "ambiguous",
+                "insufficient",
+            )
         )
 
-        policies = [pooled_policy] + feasible_protected
+        if not feasible:
 
-        for policy in policies:
+            print("  >>> INFEASIBLE TARGET CONFIGURATION")
 
-            result = evaluate_policy(
-                policy=policy,
-                observations=deployment_data,
-                deployment_mix=deployment_mix,
+            calibration_rows.append(
+                {
+                    "target_label": target_label,
+                    "target_sufficient": tau_s,
+                    "target_ambiguous": tau_a,
+                    "target_insufficient": tau_i,
+                    "lambda_sufficient": calibration["sufficient"]["lambda"],
+                    "lambda_ambiguous": calibration["ambiguous"]["lambda"],
+                    "lambda_insufficient": calibration["insufficient"]["lambda"],
+                    "achieved_sufficient": calibration["sufficient"]["achieved"],
+                    "achieved_ambiguous": calibration["ambiguous"]["achieved"],
+                    "achieved_insufficient": calibration["insufficient"]["achieved"],
+                    "feasible_sufficient": calibration["sufficient"]["feasible"],
+                    "feasible_ambiguous": calibration["ambiguous"]["feasible"],
+                    "feasible_insufficient": calibration["insufficient"]["feasible"],
+                    "feasible": False,
+                }
             )
 
-            result["deploy_mix"] = deployment_name
-
-            all_results.append(result)
-
-            print()
-            print(f"Policy: {policy.name}")
-            print(
-                f"  epistemic={result['epistemic_utility']:.4f}"
-            )
-            print(
-                "  sufficient="
-                f"{result['category_sufficient_epistemic']:.4f}"
-            )
-            print(
-                "  ambiguous="
-                f"{result['category_ambiguous_epistemic']:.4f}"
-            )
-            print(
-                "  insufficient="
-                f"{result['category_insufficient_epistemic']:.4f}"
-            )
-
-            if policy.kind == "pooled":
-                print(
-                    f"  pooled target={POOLED_TARGET:.4f}"
-                )
-                print(
-                    f"  pooled floor met="
-                    f"{result['pooled_floor_met']}"
-                )
-            else:
-                print(
-                    f"  max category undershoot="
-                    f"{result['max_category_undershoot']:.6f}"
-                )
-                print(
-                    f"  ALL CATEGORY FLOORS MET="
-                    f"{result['all_category_floors_met']}"
-                )
-
-    # -----------------------------------------------------------------------
-    # Write detailed results
-    # -----------------------------------------------------------------------
-
-    detailed_path = (
-        RESULTS / "pooled_vs_protected_crs.csv"
-    )
-
-    fieldnames = sorted(
-        {
-            key
-            for result in all_results
-            for key in result.keys()
-        }
-    )
-
-    with detailed_path.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=fieldnames,
-            extrasaction="ignore",
-        )
-
-        writer.writeheader()
-
-        for result in all_results:
-            writer.writerow(result)
-
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
-
-    summary_rows: List[Dict[str, object]] = []
-
-    for deployment_name in DEPLOYMENT_MIXES:
-        rows = [
-            row
-            for row in all_results
-            if row["deploy_mix"] == deployment_name
-        ]
-
-        pooled_rows = [
-            row
-            for row in rows
-            if row["policy_kind"] == "pooled"
-        ]
-
-        protected_rows = [
-            row
-            for row in rows
-            if row["policy_kind"] == "protected"
-        ]
-
-        if not pooled_rows:
             continue
 
-        pooled = pooled_rows[0]
+        lambdas = {
+            "sufficient": calibration["sufficient"]["lambda"],
+            "ambiguous": calibration["ambiguous"]["lambda"],
+            "insufficient": calibration["insufficient"]["lambda"],
+        }
 
-        protected_floor_successes = sum(
-            bool(row["all_category_floors_met"])
-            for row in protected_rows
+        print(
+            f"  Lambdas: "
+            f"s={lambdas['sufficient']:.6f} "
+            f"a={lambdas['ambiguous']:.6f} "
+            f"i={lambdas['insufficient']:.6f}"
         )
 
-        protected_count = len(protected_rows)
+        # --------------------------------------------------------------------
+        # Calibration diagnostics
+        # --------------------------------------------------------------------
 
-        best_protected = max(
-            protected_rows,
-            key=lambda row: float(row["epistemic_utility"]),
-            default=None,
+        calibration_metrics = evaluate_protected_policy(
+            data_train,
+            lambdas,
+            target_tuple,
         )
 
-        summary_rows.append(
+        calibration_rows.append(
             {
-                "deploy_mix": deployment_name,
-
-                "pooled_epistemic_utility":
-                    pooled["epistemic_utility"],
-
-                "pooled_sufficient_epistemic":
-                    pooled["category_sufficient_epistemic"],
-
-                "pooled_ambiguous_epistemic":
-                    pooled["category_ambiguous_epistemic"],
-
-                "pooled_insufficient_epistemic":
-                    pooled["category_insufficient_epistemic"],
-
-                "pooled_floor_met":
-                    pooled["pooled_floor_met"],
-
-                "protected_feasible_policy_count":
-                    protected_count,
-
-                "protected_floor_success_count":
-                    protected_floor_successes,
-
-                "protected_floor_success_rate":
-                    (
-                        protected_floor_successes / protected_count
-                        if protected_count
-                        else float("nan")
-                    ),
-
-                "best_protected_policy":
-                    (
-                        best_protected["policy"]
-                        if best_protected
-                        else ""
-                    ),
-
-                "best_protected_epistemic_utility":
-                    (
-                        best_protected["epistemic_utility"]
-                        if best_protected
-                        else float("nan")
-                    ),
-
-                "best_protected_sufficient_epistemic":
-                    (
-                        best_protected[
-                            "category_sufficient_epistemic"
-                        ]
-                        if best_protected
-                        else float("nan")
-                    ),
-
-                "best_protected_ambiguous_epistemic":
-                    (
-                        best_protected[
-                            "category_ambiguous_epistemic"
-                        ]
-                        if best_protected
-                        else float("nan")
-                    ),
-
-                "best_protected_insufficient_epistemic":
-                    (
-                        best_protected[
-                            "category_insufficient_epistemic"
-                        ]
-                        if best_protected
-                        else float("nan")
-                    ),
+                "target_label": target_label,
+                "target_sufficient": tau_s,
+                "target_ambiguous": tau_a,
+                "target_insufficient": tau_i,
+                "lambda_sufficient": lambdas["sufficient"],
+                "lambda_ambiguous": lambdas["ambiguous"],
+                "lambda_insufficient": lambdas["insufficient"],
+                "achieved_sufficient": calibration_metrics[
+                    "category_sufficient_epistemic"
+                ],
+                "achieved_ambiguous": calibration_metrics[
+                    "category_ambiguous_epistemic"
+                ],
+                "achieved_insufficient": calibration_metrics[
+                    "category_insufficient_epistemic"
+                ],
+                "epistemic_utility": calibration_metrics[
+                    "epistemic_utility"
+                ],
+                "max_category_undershoot": calibration_metrics[
+                    "max_category_undershoot"
+                ],
+                "all_category_floors_met": calibration_metrics[
+                    "all_category_floors_met"
+                ],
+                "feasible": True,
             }
         )
 
-    summary_path = (
-        RESULTS / "pooled_vs_protected_crs_summary.csv"
+        # --------------------------------------------------------------------
+        # Frozen-policy deployment evaluation
+        # --------------------------------------------------------------------
+
+        for deploy_name, deploy_mix in DEPLOY_MIXES.items():
+
+            print()
+            print(f"Deployment: {deploy_name}")
+
+            data_deploy = generate_dataset(
+                N_DEPLOY,
+                seed=1,
+                evidence_probs=deploy_mix,
+            )
+
+            metrics = evaluate_protected_policy(
+                data_deploy,
+                lambdas,
+                target_tuple,
+            )
+
+            row = {
+                "target_label": target_label,
+                "deploy_mix": deploy_name,
+                "mix_sufficient": deploy_mix[0],
+                "mix_ambiguous": deploy_mix[1],
+                "mix_insufficient": deploy_mix[2],
+                "lambda_sufficient": lambdas["sufficient"],
+                "lambda_ambiguous": lambdas["ambiguous"],
+                "lambda_insufficient": lambdas["insufficient"],
+                **metrics,
+            }
+
+            deployment_rows.append(row)
+
+            print(
+                f"  epistemic={metrics['epistemic_utility']:.4f}"
+            )
+            print(
+                f"  sufficient="
+                f"{metrics['category_sufficient_epistemic']:.4f} "
+                f"/ target {tau_s:.4f}"
+            )
+            print(
+                f"  ambiguous="
+                f"{metrics['category_ambiguous_epistemic']:.4f} "
+                f"/ target {tau_a:.4f}"
+            )
+            print(
+                f"  insufficient="
+                f"{metrics['category_insufficient_epistemic']:.4f} "
+                f"/ target {tau_i:.4f}"
+            )
+            print(
+                f"  max undershoot="
+                f"{metrics['max_category_undershoot']:.4f}"
+            )
+            print(
+                "  ALL FLOORS MET="
+                f"{'YES' if metrics['all_category_floors_met'] else 'NO'}"
+            )
+
+    # =========================================================================
+    # Save outputs
+    # =========================================================================
+
+    targets_path = (
+        RESULTS_DIR
+        / "protected_category_constraint_shift_targets.csv"
     )
 
-    summary_fields = list(summary_rows[0].keys())
+    results_path = (
+        RESULTS_DIR
+        / "protected_category_constraint_shift.csv"
+    )
 
-    with summary_path.open(
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=summary_fields,
+    summary_path = (
+        RESULTS_DIR
+        / "protected_category_constraint_shift_summary.csv"
+    )
+
+    targets_df = pd.DataFrame(calibration_rows)
+    results_df = pd.DataFrame(deployment_rows)
+
+    targets_df.to_csv(
+        targets_path,
+        index=False,
+    )
+
+    results_df.to_csv(
+        results_path,
+        index=False,
+    )
+
+    if len(results_df):
+
+        summary_df = (
+            results_df[
+                [
+                    "target_label",
+                    "deploy_mix",
+                    "epistemic_utility",
+                    "category_sufficient_epistemic",
+                    "category_ambiguous_epistemic",
+                    "category_insufficient_epistemic",
+                    "max_category_undershoot",
+                    "all_category_floors_met",
+                ]
+            ]
+            .sort_values(
+                [
+                    "target_label",
+                    "deploy_mix",
+                ]
+            )
         )
 
-        writer.writeheader()
+    else:
+        summary_df = pd.DataFrame(
+            columns=[
+                "target_label",
+                "deploy_mix",
+                "epistemic_utility",
+                "category_sufficient_epistemic",
+                "category_ambiguous_epistemic",
+                "category_insufficient_epistemic",
+                "max_category_undershoot",
+                "all_category_floors_met",
+            ]
+        )
 
-        for row in summary_rows:
-            writer.writerow(row)
+    summary_df.to_csv(
+        summary_path,
+        index=False,
+    )
 
-    # -----------------------------------------------------------------------
-    # Final interpretation
-    # -----------------------------------------------------------------------
+    # =========================================================================
+    # Final report
+    # =========================================================================
+
+    feasible_count = int(
+        targets_df["feasible"].sum()
+    ) if len(targets_df) else 0
+
+    total_count = len(target_tuples)
 
     print()
     print("=" * 78)
     print("EXPERIMENT COMPLETE")
     print("=" * 78)
+
     print()
-    print(f"Results: {detailed_path}")
-    print(f"Summary: {summary_path}")
-    print()
-    print(
-        "The comparison deliberately keeps calibration fixed at 40/30/30."
-    )
-    print(
-        "Policies are NOT recalibrated after the deployment distribution "
-        "changes."
-    )
+    print(f"Results:  {results_path}")
+    print(f"Targets:  {targets_path}")
+    print(f"Summary:  {summary_path}")
+
     print()
     print(
-        "The key question is whether the original pooled CRS aggregate "
-        "guarantee"
+        f"Feasible target configurations: "
+        f"{feasible_count}/{total_count}"
     )
-    print(
-        "corresponds to category-level protection under transport."
-    )
+
+    if len(results_df):
+
+        print()
+        print("-" * 78)
+        print("EASIER DEPLOYMENT: 70/20/10")
+        print("-" * 78)
+
+        easier = results_df[
+            results_df["deploy_mix"] == "easier_70_20_10"
+        ].copy()
+
+        print(
+            easier[
+                [
+                    "target_label",
+                    "epistemic_utility",
+                    "category_sufficient_epistemic",
+                    "category_ambiguous_epistemic",
+                    "category_insufficient_epistemic",
+                    "max_category_undershoot",
+                    "all_category_floors_met",
+                ]
+            ]
+            .round(4)
+            .to_string(index=False)
+        )
+
+        print()
+        print("-" * 78)
+        print("ALL DEPLOYMENT RESULTS")
+        print("-" * 78)
+
+        print(
+            results_df[
+                [
+                    "target_label",
+                    "deploy_mix",
+                    "epistemic_utility",
+                    "max_category_undershoot",
+                    "all_category_floors_met",
+                ]
+            ]
+            .sort_values(
+                [
+                    "target_label",
+                    "deploy_mix",
+                ]
+            )
+            .round(4)
+            .to_string(index=False)
+        )
+
     print()
+    print("=" * 78)
+    print("INTERPRETATION")
+    print("=" * 78)
+
     print(
-        "For protected CRS, success requires every independently specified "
-        "category"
+        """
+The decisive test is whether the independently specified category floors
+remain satisfied after the deployment distribution changes.
+
+A successful result is:
+
+    category floors satisfied under calibration
+        AND
+    category floors satisfied under every deployment mix.
+
+That supports category-conditional protection as a remedy for the specific
+pooled-aggregate transport failure.
+
+A failure is also scientifically useful:
+
+    category floors satisfied under calibration
+        BUT
+    one or more category floors violated after deployment.
+
+That shows evidence-category conditioning alone is insufficient and motivates
+finer-grained conditional guarantees, uncertainty-set constraints, or
+distributionally robust optimization.
+
+IMPORTANT:
+
+Infeasible target configurations are NOT counted as successful policies.
+They remain in the calibration output so the feasibility boundary remains
+visible.
+
+The key paper comparison should be:
+
+    original pooled CRS
+        vs.
+    feasible protected-category CRS
+
+using the SAME deployment mixtures and SAME evaluation definitions.
+"""
     )
-    print(
-        "floor to remain satisfied under deployment."
-    )
-    print()
-    print(
-        "For pooled CRS, only the aggregate floor is guaranteed."
-    )
-    print(
-        "Its category-specific results are reported diagnostically rather "
-        "than treated"
-    )
-    print(
-        "as constraints."
-    )
-    print()
 
 
 if __name__ == "__main__":
     main()
+```
