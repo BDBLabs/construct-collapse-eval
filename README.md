@@ -1,5 +1,7 @@
 # Construct Collapse in Scalar Preference Evaluation
 
+_A BagelTech project._
+
 A synthetic contextual-bandit simulation testing whether scalar (weighted-sum)
 preference aggregation can conceal epistemically important behavior — specifically,
 whether a policy can achieve a high aggregate reward while systematically hiding
